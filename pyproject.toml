@@ -12,4 +12,19 @@ dependencies = [
     "langgraph>=0.5.0",
     "langgraph-checkpoint-sqlite",
     "faker>=28.0.0",
+    "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+# pip install "sql-analyst-agent[postgres]"
+postgres = ["psycopg2-binary>=2.9"]
+# pip install "sql-analyst-agent[mysql]"
+mysql = ["pymysql>=1.0"]
+# pip install "sql-analyst-agent[mssql]"
+mssql = ["pyodbc>=4.0"]
+# pip install "sql-analyst-agent[all-drivers]"
+all-drivers = [
+    "psycopg2-binary>=2.9",
+    "pymysql>=1.0",
+    "pyodbc>=4.0",
 ]

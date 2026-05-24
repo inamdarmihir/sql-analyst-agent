@@ -1,44 +1,68 @@
+"""SQL Analyst Agent entry point.
+
+Exports a single ``agent`` variable at module level so LangGraph can resolve
+the ``./agent.py:agent`` reference in ``langgraph.json``.
+
+``create_deep_agent`` includes FilesystemMiddleware (and therefore ``write_file``
+/ ``read_file``) in its default base stack, so those tools are always present
+without any extra imports.
+"""
+
+import os
+
 from deepagents import create_deep_agent
 from langchain_quickjs import CodeInterpreterMiddleware
-from langgraph.checkpoint.memory import MemorySaver
-
-try:
-    from deepagents.tools import read_file, write_file
-except ImportError:  # pragma: no cover - compatibility fallback across deepagents versions
-    from deepagents import read_file, write_file
 
 from tools.sql_tools import execute_query, get_schema
 
-SYSTEM_PROMPT = """You are a precise SQL analyst working on a local SQLite e-commerce dataset.
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are a precise SQL analyst. You have access to a relational
+database through the execute_query and get_schema tools.
 
-Operating rules:
-1. Always call get_schema first from inside the interpreter before writing any SQL.
-2. Store every execute_query result as a named interpreter variable. Never place raw rows directly into model context.
-3. Use tools.task for narrative analysis of result sets. Sub-agents must be invoked by interpreter code, not by the root model directly.
-4. Before your final response, write the final report to the virtual filesystem using write_file.
-5. Your final answer must include:
-   - Report file path written with write_file.
-   - A section named "Query and Delegation Trace" describing:
-     a) which SQL queries were run,
-     b) what was analyzed in interpreter state,
-     c) what was delegated to sub-agents via tools.task.
+The target database is set via the DATABASE_URL environment variable (a standard
+SQLAlchemy connection URL). It defaults to a local SQLite demo database but can
+point to PostgreSQL, MySQL, SQL Server, or any other SQLAlchemy-supported engine.
 
-Interpreter execution style example:
+## Operating rules
+
+1. **Schema first** — always call get_schema from inside the interpreter before
+   writing any SQL. Use the returned dialect name to write syntax-appropriate queries.
+
+2. **Interpreter-only results** — store every execute_query result as a named
+   interpreter variable. Never include raw rows in your final model response.
+
+3. **Sub-agent delegation** — use tools.task for all narrative analysis of result
+   sets. The interpreter calls the sub-agent; the root model synthesises the
+   combined output.
+
+4. **Persist the report** — before your final response, write the complete report
+   to the virtual filesystem using write_file.
+
+5. **Trace section** — your final response must include a "Query and Delegation
+   Trace" section listing:
+   a) which SQL queries were executed,
+   b) what computations ran in interpreter state,
+   c) which slices were delegated to sub-agents via tools.task.
+
+## Interpreter example
+
 ```typescript
-// Example: answering "which product category has highest return rate?"
+// Example: "Which product category has the highest return rate?"
 const schema = await tools.getSchema({});
-console.log("Schema loaded:", Object.keys(schema.tables));
+console.log("Dialect:", schema.dialect, "Tables:", Object.keys(schema.tables));
 
 const returnRates = await tools.executeQuery({
   sql: `
     SELECT
       p.category,
-      COUNT(CASE WHEN o.status = 'returned' THEN 1 END) * 100.0 / COUNT(*) as return_rate,
-      COUNT(*) as total_orders,
-      ROUND(AVG(oi.unit_price * (1 - oi.discount_pct/100)), 2) as avg_price
+      COUNT(CASE WHEN o.status = 'returned' THEN 1 END) * 100.0 / COUNT(*) AS return_rate,
+      COUNT(*)                                                               AS total_orders,
+      ROUND(AVG(oi.unit_price * (1 - oi.discount_pct / 100)), 2)            AS avg_price
     FROM orders o
     JOIN order_items oi ON o.id = oi.order_id
-    JOIN products p ON oi.product_id = p.id
+    JOIN products    p  ON oi.product_id = p.id
     GROUP BY p.category
     ORDER BY return_rate DESC
   `
@@ -48,35 +72,40 @@ const returnRates = await tools.executeQuery({
 const analysis = await Promise.all(
   returnRates.rows.map(row =>
     tools.task({
-      description: `Analyze why ${row.category} might have a ${row.return_rate.toFixed(1)}% return rate given avg price $${row.avg_price}. Return 2-3 sentences.`,
+      description: `Analyze why the ${row.category} category might have a ${row.return_rate.toFixed(1)}% return rate given an average price of $${row.avg_price}. Return 2-3 concise sentences.`,
       subagent_type: "general-purpose",
     })
   )
 );
 
-const report = returnRates.rows.map((row, i) =>
-  `## ${row.category}\nReturn rate: ${row.return_rate.toFixed(1)}%\n${analysis[i]}`
-).join("\n\n");
+// \\n inside the template literals below produces literal newlines in the output string
+const report = returnRates.rows
+  .map((row, i) => `## ${row.category}\nReturn rate: ${row.return_rate.toFixed(1)}%\n${analysis[i]}`)
+  .join("\n\n");
 
 report;
 ```
 """
 
-checkpointer = MemorySaver()
-
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+# FilesystemMiddleware (and its write_file / read_file tools) is included in
+# create_deep_agent's default base stack — no need to add it explicitly.
+# Checkpointer is omitted: LangGraph API manages persistence automatically
+# when running under `langgraph dev` or a deployed server.
 agent = create_deep_agent(
-    model="anthropic:claude-sonnet-4-6",
-    tools=[execute_query, get_schema, write_file, read_file],
+    model=os.getenv("MODEL", "anthropic:claude-sonnet-4-6"),
+    tools=[execute_query, get_schema],
     system_prompt=SYSTEM_PROMPT,
-    checkpointer=checkpointer,
     middleware=[
         CodeInterpreterMiddleware(
-            ptc=["execute_query", "get_schema", "task"],
-            timeout=15.0,
+            ptc=["execute_query", "get_schema", "write_file", "read_file", "task"],
+            timeout=30.0,
             max_ptc_calls=100,
             max_result_chars=8000,
             snapshot_between_turns=True,
             capture_console=True,
-        )
+        ),
     ],
 )
